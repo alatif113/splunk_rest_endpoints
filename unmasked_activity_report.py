@@ -1,17 +1,15 @@
 import json
 import time
 import logging
-import splunklib.client as client
+import splunk.rest.simplerequests as simplerequests
 
 UNMASKED_SEARCH = "ITP - Unmasked Activity Report - Template"
-
-SERVICE_REALM = "itp_secure_api"
-SERVICE_USERNAME = "svc_itp_backend"
 
 INDEX_PREFIX = "itp_pri_"
 SOURCE_PREFIX = "Threat - "
 
 JOB_TIMEOUT_SECONDS = 300
+SPLUNK_APP = "itp"
 
 logger = logging.getLogger("splunk.itp")
 
@@ -33,18 +31,14 @@ class UnmaskedActivityReportHandler:
                 raise Exception("Missing required parameters")
 
             pri_ids = [x.strip() for x in pri_raw.split(",") if x.strip()]
-
-            service = self._connect_service_account(request)
             multisearch = self._build_multisearch(pri_ids, member_firm)
+            token = request["session"]["authtoken"]
 
-            job = service.saved_searches[UNMASKED_SEARCH].dispatch(
-                **{
-                    "args.multisearch": multisearch,
-                    "args.maskmap": json.dumps(maskmap)
-                }
-            )
+            # Dispatch saved search
+            sid = self._dispatch_saved_search(token, UNMASKED_SEARCH, multisearch, maskmap)
 
-            self._wait(job)
+            # Wait for search job to complete
+            self._wait(token, sid)
 
             logger.info(json.dumps({
                 "investigation_id": investigation_id,
@@ -54,10 +48,11 @@ class UnmaskedActivityReportHandler:
                 "user": user,
                 "member_firm": member_firm,
                 "pri_count": len(pri_ids),
-                "sid": job.sid
+                "sid": sid
             }))
 
-            results = job.results(output_mode="csv", count=0)
+            # Fetch results in CSV
+            results_csv = self._get_results(token, sid)
 
             return {
                 "status": 200,
@@ -65,7 +60,7 @@ class UnmaskedActivityReportHandler:
                     "Content-Type": "text/csv",
                     "Content-Disposition": f'attachment; filename="{user}.csv"'
                 },
-                "body": results.read()
+                "body": results_csv
             }
 
         except Exception as e:
@@ -85,31 +80,69 @@ class UnmaskedActivityReportHandler:
                 })
             }
 
-    # --------------------------------------------------
+    # --------------------------
 
-    def _connect_service_account(self, request):
-        service = client.connect(
-            token=request["session"]["authtoken"],
-            owner="nobody",
-            app="itp"
-        )
+    def _dispatch_saved_search(self, token, search_name, multisearch, maskmap):
+        url = f"/servicesNS/nobody/{SPLUNK_APP}/saved/searches/{search_name}/dispatch"
+        headers = {"Authorization": f"Bearer {token}"}
+        data = {
+            "args.multisearch": multisearch,
+            "args.maskmap": json.dumps(maskmap)
+        }
 
-        for cred in service.storage_passwords:
-            if cred.realm == SERVICE_REALM and cred.username == SERVICE_USERNAME:
-                return client.connect(
-                    username=SERVICE_USERNAME,
-                    password=cred.clear_password,
-                    host="localhost",
-                    port=8089,
-                    scheme="https",
-                    app="itp"
-                )
+        resp = simplerequests.post(url, headers=headers, data=data)
+        if resp.status != 201:
+            raise Exception(f"Failed to dispatch search: {resp.data}")
 
-        raise Exception("Service credentials not found")
+        return resp.data.get("sid")
 
-    # --------------------------------------------------
+    # --------------------------
+
+    def _wait(self, token, sid):
+        url = f"/services/search/jobs/{sid}"
+        headers = {"Authorization": f"Bearer {token}"}
+        start = time.time()
+
+        while True:
+            resp = simplerequests.get(url, headers=headers)
+            if resp.status != 200:
+                raise Exception(f"Failed to poll job: {resp.data}")
+
+            job_info = resp.data
+            dispatch_state = job_info.get("entry")[0]["content"]["dispatchState"]
+
+            if dispatch_state in ("DONE", "FAILED", "FAILED_CANCELLED"):
+                break
+
+            if time.time() - start > JOB_TIMEOUT_SECONDS:
+                raise Exception("Search timeout")
+
+            time.sleep(0.5)
+
+        if dispatch_state != "DONE":
+            raise Exception("Search job failed")
+
+    # --------------------------
+
+    def _get_results(self, token, sid):
+        url = f"/services/search/jobs/{sid}/results?output_mode=csv&count=0"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = simplerequests.get(url, headers=headers)
+        if resp.status != 200:
+            raise Exception(f"Failed to fetch results: {resp.data}")
+
+        return resp.data
+
+    # --------------------------
 
     def _build_multisearch(self, pri_ids, firm):
+        """
+        Build a multisearch string for Splunk.
+
+        Single PRI: returns normal search string.
+        Multiple PRIs: returns a proper multisearch string.
+        """
         searches = []
 
         for item in pri_ids:
@@ -124,22 +157,12 @@ class UnmaskedActivityReportHandler:
                 f'user={user_val}'
             )
 
-            searches.append(f"[{search}]")
+            searches.append(search)
 
         if len(searches) == 1:
-            return searches[0][1:-1]
+            # Single search: no multisearch needed
+            return searches[0]
 
-        return "| multisearch " + " ".join(searches)
-
-    # --------------------------------------------------
-
-    def _wait(self, job):
-        start = time.time()
-        while not job.is_done():
-            if time.time() - start > JOB_TIMEOUT_SECONDS:
-                raise Exception("Search timeout")
-            time.sleep(0.5)
-            job.refresh()
-
-        if job["dispatchState"] == "FAILED":
-            raise Exception("Search job failed")
+        # Multiple searches: combine using multisearch
+        wrapped_searches = [f"[{s}]" for s in searches]
+        return "| multisearch " + " ".join(wrapped_searches)
