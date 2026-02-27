@@ -12,7 +12,7 @@ require([
 
 
     /* ============================================================
-       1️⃣ CASE SUMMARY (JSON RESPONSE)
+       CASE SUMMARY (JSON RESPONSE)
     ============================================================ */
 
     function fetchCaseSummary() {
@@ -53,7 +53,7 @@ require([
 
 
     /* ============================================================
-       2️⃣ ACTIVITY REPORT (CSV DOWNLOAD)
+       ACTIVITY REPORT (CSV DOWNLOAD)
     ============================================================ */
 
     function fetchActivityReport() {
