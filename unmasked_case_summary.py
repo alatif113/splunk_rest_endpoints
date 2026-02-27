@@ -8,7 +8,7 @@ OPM_SEARCH = "ITP - OPM Private Lookup - Template"
 MASKMAP_SEARCH = "ITP - Get Mask Map by ID - Template"
 
 SERVICE_REALM = "itp_secure_api"
-SERVICE_USERNAME = "svc_itp_backend"
+SERVICE_USERNAME = "svc_itp_unmask"
 
 TIME_OFFSET = 1
 JOB_TIMEOUT_SECONDS = 300
