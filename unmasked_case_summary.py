@@ -1,21 +1,21 @@
 import json
 import time
 import logging
-import splunklib.client as client
+import splunk.rest.simplerequests as simplerequests
 
-OPM_SEARCH = "ITP - OPM Private Lookup - Template"
-MASKMAP_SEARCH = "ITP - Get Mask Map by ID - Template"
+UNMASKED_SEARCH = "ITP - Unmasked Activity Report - Template"
 
-SERVICE_REALM = "itp_secure_api"
-SERVICE_USERNAME = "svc_itp_backend"
+INDEX_PREFIX = "itp_pri_"
+SOURCE_PREFIX = "Threat - "
 
-TIME_OFFSET = 1
 JOB_TIMEOUT_SECONDS = 300
+
+SPLUNK_APP = "itp"
 
 logger = logging.getLogger("splunk.itp")
 
 
-class UnmaskedCaseSummaryHandler:
+class UnmaskedActivityReportHandler:
 
     def handle_POST(self, request, investigation_id):
         requester = request.get("user", "unknown")
@@ -23,44 +23,51 @@ class UnmaskedCaseSummaryHandler:
         try:
             payload = json.loads(request.get("payload", "{}"))
 
-            user = payload.get("user")
+            pri_raw = payload.get("pri_group_ids")
             member_firm = payload.get("member_firm")
-            maskmap_ids_raw = payload.get("maskmap_ids", "")
+            user = payload.get("user")
+            maskmap = payload.get("maskmap")
 
-            if not user or not member_firm:
+            if not pri_raw or not member_firm or not user:
                 raise Exception("Missing required parameters")
 
-            maskmap_ids = [x.strip() for x in maskmap_ids_raw.split(",") if x.strip()]
+            pri_ids = [x.strip() for x in pri_raw.split(",") if x.strip()]
+            multisearch = self._build_multisearch(pri_ids, member_firm)
+            token = request["session"]["authtoken"]
 
-            service = self._connect_service_account(request)
+            # Dispatch the saved search
+            sid = self._dispatch_saved_search(token, UNMASKED_SEARCH, multisearch, maskmap)
 
-            opm_result = self._run_opm(service, user, member_firm)
-            maskmap_result = self._run_maskmap(service, maskmap_ids, member_firm)
+            # Wait for job to complete
+            self._wait(token, sid)
 
             logger.info(json.dumps({
                 "investigation_id": investigation_id,
-                "event": "case_summary",
+                "event": "activity_report",
                 "status": "success",
                 "requester": requester,
                 "user": user,
                 "member_firm": member_firm,
-                "maskmap_count": len(maskmap_ids)
+                "pri_count": len(pri_ids),
+                "sid": sid
             }))
+
+            # Fetch results
+            results_csv = self._get_results(token, sid)
 
             return {
                 "status": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({
-                    "user_details": opm_result,
-                    "maskmap": maskmap_result,
-                    "investigation_id": investigation_id
-                })
+                "headers": {
+                    "Content-Type": "text/csv",
+                    "Content-Disposition": f'attachment; filename="{user}.csv"'
+                },
+                "body": results_csv
             }
 
         except Exception as e:
             logger.warning(json.dumps({
                 "investigation_id": investigation_id,
-                "event": "case_summary",
+                "event": "activity_report",
                 "status": "failed",
                 "requester": requester,
                 "error": str(e)
@@ -74,84 +81,81 @@ class UnmaskedCaseSummaryHandler:
                 })
             }
 
-    # --------------------------------------------------
+    # --------------------------
 
-    def _connect_service_account(self, request):
-        service = client.connect(
-            token=request["session"]["authtoken"],
-            owner="nobody",
-            app="itp"
-        )
+    def _dispatch_saved_search(self, token, search_name, multisearch, maskmap):
+        url = f"/servicesNS/nobody/{SPLUNK_APP}/saved/searches/{search_name}/dispatch"
+        data = {
+            "args.multisearch": multisearch,
+            "args.maskmap": json.dumps(maskmap)
+        }
+        headers = {"Authorization": f"Bearer {token}"}
 
-        for cred in service.storage_passwords:
-            if cred.realm == SERVICE_REALM and cred.username == SERVICE_USERNAME:
-                return client.connect(
-                    username=SERVICE_USERNAME,
-                    password=cred.clear_password,
-                    host="localhost",
-                    port=8089,
-                    scheme="https",
-                    app="itp"
-                )
+        resp = simplerequests.post(url, headers=headers, data=data)
+        if resp.status != 201:
+            raise Exception(f"Failed to dispatch search: {resp.data}")
 
-        raise Exception("Service credentials not found")
+        # The SID is returned in JSON under 'sid'
+        return resp.data.get("sid")
 
-    # --------------------------------------------------
+    # --------------------------
 
-    def _run_opm(self, service, user, member_firm):
-        job = service.saved_searches[OPM_SEARCH].dispatch(
-            **{
-                "args.user": user,
-                "args.member_firm": member_firm
-            }
-        )
-        self._wait(job)
-        results = job.results(output_mode="json")
-        return json.load(results).get("results", [{}])[0]
-
-    # --------------------------------------------------
-
-    def _run_maskmap(self, service, ids, member_firm):
-        if not ids:
-            return {}
-
-        timestamps = [int(i.split("@@")[0]) for i in ids]
-        earliest = min(timestamps)
-        latest = max(timestamps) + TIME_OFFSET
-
-        job = service.saved_searches[MASKMAP_SEARCH].dispatch(
-            **{
-                "args.earliest": earliest,
-                "args.latest": latest,
-                "args.maskmap_id": " ".join(ids),
-                "args.member_firm": member_firm
-            }
-        )
-
-        self._wait(job)
-
-        results = job.results(output_mode="json")
-        reader = json.load(results)
-
-        combined = {}
-        if reader.get("results"):
-            for value in reader["results"][0].values():
-                try:
-                    combined.update(json.loads(value))
-                except Exception:
-                    continue
-
-        return combined
-
-    # --------------------------------------------------
-
-    def _wait(self, job):
+    def _wait(self, token, sid):
+        url = f"/services/search/jobs/{sid}"
+        headers = {"Authorization": f"Bearer {token}"}
         start = time.time()
-        while not job.is_done():
+
+        while True:
+            resp = simplerequests.get(url, headers=headers)
+            if resp.status != 200:
+                raise Exception(f"Failed to poll job: {resp.data}")
+
+            job_info = resp.data
+            dispatch_state = job_info.get("entry")[0]["content"]["dispatchState"]
+
+            if dispatch_state in ("DONE", "FAILED", "FAILED_CANCELLED"):
+                break
+
             if time.time() - start > JOB_TIMEOUT_SECONDS:
                 raise Exception("Search timeout")
-            time.sleep(0.5)
-            job.refresh()
 
-        if job["dispatchState"] == "FAILED":
+            time.sleep(0.5)
+
+        if dispatch_state != "DONE":
             raise Exception("Search job failed")
+
+    # --------------------------
+
+    def _get_results(self, token, sid):
+        url = f"/services/search/jobs/{sid}/results?output_mode=csv&count=0"
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = simplerequests.get(url, headers=headers)
+
+        if resp.status != 200:
+            raise Exception(f"Failed to fetch results: {resp.data}")
+
+        return resp.data
+
+    # --------------------------
+
+    def _build_multisearch(self, pri_ids, firm):
+        searches = []
+
+        for item in pri_ids:
+            timestamp, pri_name, user_val = item.split("@@")
+            earliest = int(timestamp)
+            latest = earliest + 1
+
+            search = (
+                f'search index={INDEX_PREFIX}{firm} '
+                f'earliest={earliest} latest={latest} '
+                f'source="{SOURCE_PREFIX}{pri_name}*" '
+                f'user={user_val}'
+            )
+
+            searches.append(f"[{search}]")
+
+        if len(searches) == 1:
+            return searches[0][1:-1]
+
+        return "| multisearch " + " ".join(searches)
