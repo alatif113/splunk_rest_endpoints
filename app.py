@@ -1,8 +1,12 @@
 import json
 import logging
 from splunk.persistconn.application import PersistentServerConnectionApplication
-from handlers.case_summary import UnmaskedCaseSummaryHandler
-from handlers.activity_report import UnmaskedActivityReportHandler
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "handlers"))
+
+# Now imports work
+from case_summary import UnmaskedCaseSummaryHandler
+from activity_report import UnmaskedActivityReportHandler
 
 logger = logging.getLogger("splunk.itp")
 logger.setLevel(logging.INFO)
