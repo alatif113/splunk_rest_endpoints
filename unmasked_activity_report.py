@@ -5,7 +5,7 @@ import requests
 
 UNMASKED_SEARCH = "ITP - Unmasked Activity Report - Template"
 SERVICE_REALM = "itp_secure_api"
-SERVICE_USERNAME = "svc_itp_backend"
+SERVICE_USERNAME = "svc_itp_unmask"
 
 INDEX_PREFIX = "itp_pri_"
 SOURCE_PREFIX = "Threat - "
